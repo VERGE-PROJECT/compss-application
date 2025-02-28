@@ -1,102 +1,81 @@
-import argparse
-from prometheus_client import CollectorRegistry, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from flask import Flask, Response
-import os
-import re
-import socket
 import redis
 import threading
 import time
-import sys
+import argparse
+from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from flask import Flask, Response
 
+# Argument parser to accept command-line parameters
+parser = argparse.ArgumentParser(description='Redis-Prometheus Metrics Server')
+parser.add_argument('--redis_port', type=int, default=6379, help='Port for Redis server')
+parser.add_argument('--prometheus_port', type=int, default=15000, help='Port for Prometheus metrics')
+args = parser.parse_args()
+
+# Redis Configuration
 REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
-REDIS_QUEUE = 'task_times_queue'
-DEFAULT_PROMETHEUS_PORT = 15000
-BATCHING_SIZE = 10 # Size of Redis POP elements in the queue
+REDIS_PORT = args.redis_port
+REDIS_COUNTER_KEY = "task_waitingqueue_counter"
+REDIS_TIME_KEY = "task_times" # Store elapsed execution time
 
+# Prometheus configuration
+PROMETHEUS_PORT = args.prometheus_port
+
+# Initialize Redis
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
 
+# Flask App for Prometheus Metrics
 app = Flask(__name__)
 
-def parse_buckets(bucket_string):
-    """
-    Parses a comma-separated string of buckets into a list of floats.
-    Example input: "0.001,0.005,0.01,0.1,1,10"
-    """
-    try:
-        return [
-            float(bucket) if bucket.lower() not in ['inf', '-inf']
-            else float('inf') if bucket.lower() == 'inf' else float('-inf')
-            for bucket in bucket_string.split(',')
-        ]
-    except ValueError:
-        raise argparse.ArgumentTypeError("Buckets must be a comma-separated list of numeric values, with 'inf' or '-inf' for infinity.")
+# Create Prometheus Registry and Metrics
+registry = CollectorRegistry()
+task_waiting_queue = Gauge(
+    "waiting_queue_tasks",
+    "Total number of tasks added to the waiting queue (pending to be computed)",
+    registry=registry
+)
+task_execution_time = Gauge(
+    "task_execution_time_seconds",
+    "Elapsed execution time of the last genetic algorithm lifecycle",
+    registry=registry
+)
 
-def create_histogram_registry(buckets=None):
+def update_metrics_from_redis():
     """
-    Creates a new Prometheus histogram registry and returns it along with the histogram object.
+    Reads the counter from Redis and updates Prometheus metrics.
     """
-    if buckets is None:
-        # Default buckets if none are provided
-        buckets = [0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.1, 1, 10, 50, 100, 200, float('inf')]
-    
-    registry = CollectorRegistry()
-
-    execution_time_task_histogram = Histogram(
-        'task_execution_time_seconds', 'Time taken for each fused_multiply_add task',
-        ['worker'], registry=registry,
-        buckets=buckets
-    )
-    return registry, execution_time_task_histogram
-
-def process_redis_queue():
-    """
-    Processes the tasks in the Redis queue and adds their values to the histogram.
-    Returns the updated registry and histogram.
-    """
-
-    global registry_histogram, execution_time_task_histogram
-    hostname_worker = socket.gethostname()
-
     while True:
         try:
-            queue_value = r.rpop(REDIS_QUEUE, BATCHING_SIZE)        
+            # Read Redis counter value
+            counter_value = r.get(REDIS_COUNTER_KEY)
+            execution_time_value = r.get(REDIS_TIME_KEY)
+            
+            if counter_value:
+                
+                task_waiting_queue.set(int(counter_value))  # Increment counter
 
-            if queue_value:
-                for q in queue_value:
-                    execution_time_task_histogram.labels(worker=hostname_worker).observe(float(q.decode("utf-8")))
-            else:
-                time.sleep(0.1)
+            if execution_time_value:
+                task_execution_time.set(float(execution_time_value))  # Update execution time metric
+
+            time.sleep(1)  # Update interval
 
         except redis.exceptions.ConnectionError as e:
-            print(f"Redis is not ready or unreachable: {e}")
-            time.sleep(1)  # Retry after a delay if Redis is down
+            print(f"Redis is not reachable: {e}")
+            time.sleep(1)
+        except ValueError as e:
+            print(f"Invalid counter value in Redis: {e}")
+
+# Start background thread to update metrics
+thread = threading.Thread(target=update_metrics_from_redis, daemon=True)
+thread.start()
 
 @app.route('/metrics', methods=['GET'])
 def metrics():
     """
-    Flask route that serves Prometheus metrics after reading and processing all the data files.
+    Flask route that serves Prometheus metrics.
     """
-    # Read data files and create the histogram
-    global registry_histogram  # Use the global registry
-
-    # Generate the latest metrics in Prometheus format
-    metrics_data = generate_latest(registry_histogram)
+    metrics_data = generate_latest(registry)
 
     return Response(metrics_data, content_type=CONTENT_TYPE_LATEST)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Prometheus Histogram Metrics Service")
-    parser.add_argument('--buckets', type=parse_buckets, 
-                        help="Comma-separated list of bucket values for the histogram (e.g., 0.001,0.005,0.01,0.1,1,10).")
-    
-    args = parser.parse_args()
-    
-    registry_histogram, execution_time_task_histogram = create_histogram_registry(buckets=args.buckets)
-
-    thread = threading.Thread(target=process_redis_queue, daemon=True)
-    thread.start()
-
-    # Start the Flask app for serving metrics
-    app.run(host='0.0.0.0', port=DEFAULT_PROMETHEUS_PORT)
+    app.run(host='0.0.0.0', port=PROMETHEUS_PORT)
